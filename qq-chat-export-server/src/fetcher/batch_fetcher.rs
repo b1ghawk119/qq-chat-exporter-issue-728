@@ -737,7 +737,10 @@ impl BatchMessageFetcher {
                     result.map(|value| (value, page))
                 })
                 .await?;
-            if anchor.is_some() && seq_window_crosses_history_start(&value) {
+            if anchor.is_some()
+                && seq_window_crosses_history_start(&value)
+                && !has_history_records(&value)
+            {
                 if page == 1 {
                     return Ok(BatchFetchResult::default());
                 }
@@ -745,7 +748,7 @@ impl BatchMessageFetcher {
                 continue;
             }
             break (
-                extract_msg_page_strict(&value).map_err(FetchError::Api)?,
+                extract_history_page(&value, anchor.is_some()).map_err(FetchError::Api)?,
                 page,
             );
         };
@@ -1132,8 +1135,8 @@ impl BatchMessageFetcher {
         // #728：重读窗口跨过历史起点时，原页可能只含边界 seq 的部分记录。
         // 用已有的 msgId 向旧方向补读，再推进序号。
         let crossed_start = seq_window_crosses_history_start(&reread);
-        if !crossed_start {
-            let reread = extract_msg_page_strict(&reread).map_err(FetchError::Api)?;
+        if !crossed_start || has_history_records(&reread) {
+            let reread = extract_history_page(&reread, true).map_err(FetchError::Api)?;
             let passed_boundary = collect_boundary_messages(
                 &reread,
                 boundary_seq,
@@ -1178,32 +1181,7 @@ impl BatchMessageFetcher {
             let (history, used) = self
                 .seq_backfill_fetch(peer, SeqBackfillQuery::MsgId(cursor_id.as_str()))
                 .await?;
-            if seq_window_crosses_history_start(&history) {
-                // 两种计数接口都可能在本机历史起点拒绝整页。直接读这个序号，
-                // 避免因丢弃错误页而漏掉同序号的其他记录。
-                let seq = boundary_seq.to_string();
-                let exact = self
-                    .call_with_retry(|_| self.api.get_msgs_by_seq_range(peer, &seq, &seq))
-                    .await?;
-                let exact = extract_msg_page_strict(&exact).map_err(FetchError::Api)?;
-                if !exact
-                    .iter()
-                    .any(|m| message_msg_id(m).as_deref() == Some(cursor_id.as_str()))
-                {
-                    return Err(FetchError::Api(format!(
-                        "定点补读未返回已知边界游标 (seq={boundary_seq})"
-                    )));
-                }
-                collect_boundary_messages(
-                    &exact,
-                    boundary_seq,
-                    &mut seen,
-                    &mut boundary_msgs,
-                    &mut recovered,
-                );
-                break;
-            }
-            let history = extract_msg_page_strict(&history).map_err(FetchError::Api)?;
+            let history = extract_history_page(&history, true).map_err(FetchError::Api)?;
             let passed = collect_boundary_messages(
                 &history,
                 boundary_seq,
@@ -1291,6 +1269,23 @@ struct SeqBoundaryBackfill {
 
 fn seq_window_crosses_history_start(value: &Value) -> bool {
     value.get("result").and_then(Value::as_i64) == Some(2_004_000)
+}
+
+// QQ can return the records it did find together with the history-start code.
+fn has_history_records(value: &Value) -> bool {
+    value
+        .get("msgList")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| !rows.is_empty())
+}
+
+fn extract_history_page(value: &Value, accept_partial: bool) -> Result<Vec<Value>, String> {
+    if accept_partial && seq_window_crosses_history_start(value) {
+        if let Some(rows) = value.get("msgList").and_then(Value::as_array) {
+            return Ok(rows.clone());
+        }
+    }
+    extract_msg_page_strict(value)
 }
 
 /// 从序列分页响应中提取消息列表，并拒绝把原生错误 / 无效响应当成空页。
@@ -2279,9 +2274,6 @@ mod tests {
                 .take(count.max(0) as usize)
                 .cloned()
                 .collect();
-            if self.reject_short_seq_windows && (messages.len() as i64) < count {
-                return Ok(json!({"result": 2_004_000, "errMsg": "no any more msg!"}));
-            }
             if self.reverse_output {
                 messages.reverse();
             }
@@ -2291,21 +2283,10 @@ mod tests {
         async fn get_msgs_by_seq_range(
             &self,
             _peer: &Peer,
-            start_seq: &str,
-            end_seq: &str,
+            _start_seq: &str,
+            _end_seq: &str,
         ) -> Result<Value, String> {
-            assert_eq!(start_seq, end_seq);
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("exact:{start_seq}"));
-            let seq: i64 = start_seq.parse().unwrap();
-            let messages: Vec<_> = self
-                .records
-                .iter()
-                .filter(|msg| loose_msg_seq(msg) == Some(seq))
-                .collect();
-            Ok(json!({ "result": 0, "msgList": messages }))
+            Ok(json!({ "result": 0, "msgList": [] }))
         }
 
         async fn get_msgs_by_seq_and_count(
@@ -2393,8 +2374,16 @@ mod tests {
         expected.sort();
         assert_eq!(ids, expected);
         assert!(api.call_log().contains(&"seq:100002:2".to_string()));
-        assert!(api.call_log().contains(&"exact:100001".to_string()));
         assert_eq!(api.call_log().last().unwrap(), "seq:100000:1");
+    }
+
+    #[test]
+    fn native_history_start_retains_returned_records() {
+        let rows = vec![json!({"msgSeq":"4390"}), json!({"msgSeq":"4391"})];
+        let response = json!({"result":2_004_000, "msgList":rows});
+        assert_eq!(extract_history_page(&response, true).unwrap(), rows);
+        assert!(extract_history_page(&response, false).is_err());
+        assert!(extract_history_page(&json!({"result":2_004_000, "msgList":"bad"}), true).is_err());
     }
 
     /// issue #716：页尾同一 msgSeq 被截断时，包含式补读必须找回 msgId=m99。
