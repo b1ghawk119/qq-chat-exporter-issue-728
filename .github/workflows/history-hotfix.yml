@@ -11,7 +11,7 @@ jobs:
   installer:
     runs-on: windows-latest
     env:
-      QCE_VERSION: 6.4.3-issue728.1
+      QCE_VERSION: 6.4.3-issue728.2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,9 +42,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release download v6.4.3 --repo shuakami/qq-chat-exporter --pattern QQChatExporter-Installer-v6.4.3.exe
-          python scripts/package-728-hotfix.py QQChatExporter-Installer-v6.4.3.exe installer/src-tauri/target/release/qce-installer.exe qq-chat-export-server/target/release/qce-server.exe QQChatExporter-Installer-v6.4.3-issue728.1.exe
+          python scripts/package-728-hotfix.py QQChatExporter-Installer-v6.4.3.exe installer/src-tauri/target/release/qce-installer.exe qq-chat-export-server/target/release/qce-server.exe QQChatExporter-Installer-v6.4.3-issue728.2.exe
       - uses: actions/upload-artifact@v4
         with:
           name: qce-installer-windows
-          path: QQChatExporter-Installer-v6.4.3-issue728.1.exe
+          path: QQChatExporter-Installer-v6.4.3-issue728.2.exe
           if-no-files-found: error

@@ -1178,6 +1178,31 @@ impl BatchMessageFetcher {
             let (history, used) = self
                 .seq_backfill_fetch(peer, SeqBackfillQuery::MsgId(cursor_id.as_str()))
                 .await?;
+            if seq_window_crosses_history_start(&history) {
+                // 两种计数接口都可能在本机历史起点拒绝整页。直接读这个序号，
+                // 避免因丢弃错误页而漏掉同序号的其他记录。
+                let seq = boundary_seq.to_string();
+                let exact = self
+                    .call_with_retry(|_| self.api.get_msgs_by_seq_range(peer, &seq, &seq))
+                    .await?;
+                let exact = extract_msg_page_strict(&exact).map_err(FetchError::Api)?;
+                if !exact
+                    .iter()
+                    .any(|m| message_msg_id(m).as_deref() == Some(cursor_id.as_str()))
+                {
+                    return Err(FetchError::Api(format!(
+                        "定点补读未返回已知边界游标 (seq={boundary_seq})"
+                    )));
+                }
+                collect_boundary_messages(
+                    &exact,
+                    boundary_seq,
+                    &mut seen,
+                    &mut boundary_msgs,
+                    &mut recovered,
+                );
+                break;
+            }
             let history = extract_msg_page_strict(&history).map_err(FetchError::Api)?;
             let passed = collect_boundary_messages(
                 &history,
@@ -2254,6 +2279,9 @@ mod tests {
                 .take(count.max(0) as usize)
                 .cloned()
                 .collect();
+            if self.reject_short_seq_windows && (messages.len() as i64) < count {
+                return Ok(json!({"result": 2_004_000, "errMsg": "no any more msg!"}));
+            }
             if self.reverse_output {
                 messages.reverse();
             }
@@ -2263,10 +2291,21 @@ mod tests {
         async fn get_msgs_by_seq_range(
             &self,
             _peer: &Peer,
-            _start_seq: &str,
-            _end_seq: &str,
+            start_seq: &str,
+            end_seq: &str,
         ) -> Result<Value, String> {
-            Ok(json!({ "result": 0, "msgList": [] }))
+            assert_eq!(start_seq, end_seq);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("exact:{start_seq}"));
+            let seq: i64 = start_seq.parse().unwrap();
+            let messages: Vec<_> = self
+                .records
+                .iter()
+                .filter(|msg| loose_msg_seq(msg) == Some(seq))
+                .collect();
+            Ok(json!({ "result": 0, "msgList": messages }))
         }
 
         async fn get_msgs_by_seq_and_count(
@@ -2354,6 +2393,7 @@ mod tests {
         expected.sort();
         assert_eq!(ids, expected);
         assert!(api.call_log().contains(&"seq:100002:2".to_string()));
+        assert!(api.call_log().contains(&"exact:100001".to_string()));
         assert_eq!(api.call_log().last().unwrap(), "seq:100000:1");
     }
 
