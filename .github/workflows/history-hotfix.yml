@@ -10,13 +10,17 @@ permissions:
 jobs:
   installer:
     runs-on: windows-latest
+    env:
+      QCE_VERSION: 6.4.3-issue728.1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: qq-chat-export-server
-          shared-key: qce-server-windows-x64
+          workspaces: |
+            qq-chat-export-server
+            installer/src-tauri
+          shared-key: qce-windows-history-hotfix
       - name: Test group history pagination
         working-directory: qq-chat-export-server
         run: cargo test --locked --release fetcher::batch_fetcher::tests

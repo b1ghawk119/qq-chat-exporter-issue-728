@@ -723,8 +723,8 @@ impl BatchMessageFetcher {
             anchor = self.seek_anchor_for_end_time(peer, filter).await;
         }
 
-        // A window crossing the first local record may fail as a whole (#728).
-        // Retry the same anchor, keeping the actual width for boundary backfill.
+        // #728：跨过本机最早消息时整页可能返回 2004000。在原锚点缩小窗口，
+        // 用实际成功的页宽判断边界是否需要补读。
         let mut limit = GROUP_SEQ_PAGE_MAX;
         let (mut messages, page) = loop {
             let (value, page) = self
@@ -1129,8 +1129,8 @@ impl BatchMessageFetcher {
         let (reread, used) = self
             .seq_backfill_fetch(peer, SeqBackfillQuery::Seq(boundary_seq))
             .await?;
-        // The seq reread crossed the history start. Continue from a known msgId
-        // because the partial page may have cut through a shared msgSeq.
+        // #728：重读窗口跨过历史起点时，原页可能只含边界 seq 的部分记录。
+        // 用已有的 msgId 向旧方向补读，再推进序号。
         let crossed_start = seq_window_crosses_history_start(&reread);
         if !crossed_start {
             let reread = extract_msg_page_strict(&reread).map_err(FetchError::Api)?;
@@ -1143,9 +1143,9 @@ impl BatchMessageFetcher {
             );
             if passed_boundary || (reread.len() as i64) < used {
                 tracing::info!(
-                "[BatchMessageFetcher] issue #716：边界 msgSeq={boundary_seq} 补读完成，补入 {} 条",
-                recovered.len()
-            );
+                    "[BatchMessageFetcher] issue #716：边界 msgSeq={boundary_seq} 补读完成，补入 {} 条",
+                    recovered.len()
+                );
                 return Ok(Some(SeqBoundaryBackfill {
                     boundary_seq,
                     messages: recovered,
@@ -1173,7 +1173,7 @@ impl BatchMessageFetcher {
             };
             requests += 1;
             tracing::info!(
-                "[BatchMessageFetcher] issue #716：边界 msgSeq={boundary_seq} 占满整页，按 msgId={cursor_id} 向旧方向补读 (第 {requests}/{SEQ_BOUNDARY_BACKFILL_MAX_REQUESTS} 次)"
+                "[BatchMessageFetcher] issue #716：边界 msgSeq={boundary_seq} 按 msgId={cursor_id} 向旧方向补读 (第 {requests}/{SEQ_BOUNDARY_BACKFILL_MAX_REQUESTS} 次)"
             );
             let (history, used) = self
                 .seq_backfill_fetch(peer, SeqBackfillQuery::MsgId(cursor_id.as_str()))
@@ -2336,7 +2336,7 @@ mod tests {
 
     #[tokio::test]
     async fn seq_history_start_recovers_partial_windows_and_shared_oldest_seq() {
-        // High sequence numbers also catch a cursor that walks empty history to zero.
+        // 最早序号远大于 1，读到起点后应直接结束。
         let mut entries: Vec<_> = (100_001..=100_007)
             .map(|seq| (seq.to_string(), seq, seq * 1_000))
             .collect();
