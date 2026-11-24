@@ -1,0 +1,46 @@
+name: Windows installer · group history hotfix
+on:
+  push:
+    branches: [fix/728-group-history-start]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: qq-chat-export-server
+          shared-key: qce-server-windows-x64
+      - name: Test group history pagination
+        working-directory: qq-chat-export-server
+        run: cargo test --locked --release fetcher::batch_fetcher::tests
+      - name: Build Windows server
+        working-directory: qq-chat-export-server
+        run: cargo build --locked --release --bin qce-server
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build versioned installer for in-place upgrades
+        working-directory: installer
+        shell: bash
+        run: |
+          npm ci
+          npm run tauri build -- --no-bundle
+      - name: Package and verify the v6.4.3 hotfix
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v6.4.3 --repo shuakami/qq-chat-exporter --pattern QQChatExporter-Installer-v6.4.3.exe
+          python scripts/package-728-hotfix.py QQChatExporter-Installer-v6.4.3.exe installer/src-tauri/target/release/qce-installer.exe qq-chat-export-server/target/release/qce-server.exe QQChatExporter-Installer-v6.4.3-issue728.1.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qce-installer-windows
+          path: QQChatExporter-Installer-v6.4.3-issue728.1.exe
+          if-no-files-found: error

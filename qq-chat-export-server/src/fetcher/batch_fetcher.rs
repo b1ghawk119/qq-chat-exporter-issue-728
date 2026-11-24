@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -723,42 +723,32 @@ impl BatchMessageFetcher {
             anchor = self.seek_anchor_for_end_time(peer, filter).await;
         }
 
-        let api = Arc::clone(&self.api);
-        let peer_clone = peer.clone();
-        // 记录实际发出的分页大小：超时重试可能缩小 batchSize，成功后的
-        // 恢复逻辑也可能放大它，事后从 state 读回的值不一定等于本次请求值。
-        let requested_page = Arc::new(AtomicI64::new(1));
-        let requested_page_in_call = Arc::clone(&requested_page);
-        let result = self
-            .call_with_retry(move |batch_size| {
-                let api = Arc::clone(&api);
-                let peer = peer_clone.clone();
-                let requested_page = Arc::clone(&requested_page_in_call);
-                async move {
-                    let page = seq_page_size(batch_size);
-                    requested_page.store(page, Ordering::SeqCst);
-                    match anchor {
-                        None => {
-                            tracing::info!(
-                                "[BatchMessageFetcher] 调用 getAioFirstViewLatestMsgs API (seq 分页首批), count={page}"
-                            );
-                            api.get_aio_first_view_latest_msgs(&peer, page).await
-                        }
-                        Some(anchor) => {
-                            tracing::info!(
-                                "[BatchMessageFetcher] 调用 getMsgsBySeqAndCount API, anchorSeq={anchor}, count={page}"
-                            );
-                            api.get_msgs_by_seq_and_count(&peer, anchor, page).await
-                        }
-                    }
+        // A window crossing the first local record may fail as a whole (#728).
+        // Retry the same anchor, keeping the actual width for boundary backfill.
+        let mut limit = GROUP_SEQ_PAGE_MAX;
+        let (mut messages, page) = loop {
+            let (value, page) = self
+                .call_with_retry(|batch_size| async move {
+                    let page = seq_page_size(batch_size).min(limit);
+                    let result = match anchor {
+                        Some(seq) => self.api.get_msgs_by_seq_and_count(peer, seq, page).await,
+                        None => self.api.get_aio_first_view_latest_msgs(peer, page).await,
+                    };
+                    result.map(|value| (value, page))
+                })
+                .await?;
+            if anchor.is_some() && seq_window_crosses_history_start(&value) {
+                if page == 1 {
+                    return Ok(BatchFetchResult::default());
                 }
-            })
-            .await?;
-
-        let page = requested_page.load(Ordering::SeqCst).max(1);
-        // issue #716：原生错误（GeneralCallResult.result != 0）与无效响应必须
-        // 显式失败，不能再像空页一样按页宽跳过而静默丢消息。
-        let mut messages = extract_msg_page_strict(&result).map_err(FetchError::Api)?;
+                limit = page / 2;
+                continue;
+            }
+            break (
+                extract_msg_page_strict(&value).map_err(FetchError::Api)?,
+                page,
+            );
+        };
 
         // issue #716：满页时页尾边界 msgSeq 可能只返回了部分记录（count 限制
         // 的是记录条数，同一 msgSeq 可混有系统提示与普通消息）。先做包含式
@@ -915,10 +905,10 @@ impl BatchMessageFetcher {
     ///
     /// issue #305 / #316：超时类错误下次重试自动折半 batchSize（不低于
     /// [`MIN_BATCH_SIZE_ON_TIMEOUT`]），让 QQ 客户端有机会用更小窗口完成查询。
-    async fn call_with_retry<F, Fut>(&self, api_call: F) -> Result<Value, FetchError>
+    async fn call_with_retry<F, Fut, T>(&self, api_call: F) -> Result<T, FetchError>
     where
         F: Fn(i64) -> Fut,
-        Fut: std::future::Future<Output = Result<Value, String>>,
+        Fut: std::future::Future<Output = Result<T, String>>,
     {
         let mut bridge_recoveries = 0_u32;
         let mut attempt = 0_u32;
@@ -1083,33 +1073,19 @@ impl BatchMessageFetcher {
         &self,
         peer: &Peer,
         query: SeqBackfillQuery<'_>,
-    ) -> Result<(Vec<Value>, i64), FetchError> {
-        let api = Arc::clone(&self.api);
-        let peer = peer.clone();
-        let used = Arc::new(AtomicI64::new(1));
-        let used_in_call = Arc::clone(&used);
-        let value = self
-            .call_with_retry(move |batch_size| {
-                let api = Arc::clone(&api);
-                let peer = peer.clone();
-                let used = Arc::clone(&used_in_call);
-                async move {
-                    let count = seq_page_size(batch_size)
-                        .clamp(SEQ_BOUNDARY_BACKFILL_MIN_COUNT, GROUP_SEQ_PAGE_MAX);
-                    used.store(count, Ordering::SeqCst);
-                    match query {
-                        SeqBackfillQuery::Seq(seq) => {
-                            api.get_msgs_by_seq_and_count(&peer, seq, count).await
-                        }
-                        SeqBackfillQuery::MsgId(msg_id) => {
-                            api.get_msg_history(&peer, msg_id, count).await
-                        }
-                    }
+    ) -> Result<(Value, i64), FetchError> {
+        self.call_with_retry(|batch_size| async move {
+            let count = seq_page_size(batch_size)
+                .clamp(SEQ_BOUNDARY_BACKFILL_MIN_COUNT, GROUP_SEQ_PAGE_MAX);
+            let result = match query {
+                SeqBackfillQuery::Seq(seq) => {
+                    self.api.get_msgs_by_seq_and_count(peer, seq, count).await
                 }
-            })
-            .await?;
-        let messages = extract_msg_page_strict(&value).map_err(FetchError::Api)?;
-        Ok((messages, used.load(Ordering::SeqCst).max(1)))
+                SeqBackfillQuery::MsgId(id) => self.api.get_msg_history(peer, id, count).await,
+            };
+            result.map(|value| (value, count))
+        })
+        .await
     }
 
     /// issue #716：满页边界 msgSeq 的包含式补读。
@@ -1153,22 +1129,28 @@ impl BatchMessageFetcher {
         let (reread, used) = self
             .seq_backfill_fetch(peer, SeqBackfillQuery::Seq(boundary_seq))
             .await?;
-        let passed_boundary = collect_boundary_messages(
-            &reread,
-            boundary_seq,
-            &mut seen,
-            &mut boundary_msgs,
-            &mut recovered,
-        );
-        if passed_boundary || (reread.len() as i64) < used {
-            tracing::info!(
+        // The seq reread crossed the history start. Continue from a known msgId
+        // because the partial page may have cut through a shared msgSeq.
+        let crossed_start = seq_window_crosses_history_start(&reread);
+        if !crossed_start {
+            let reread = extract_msg_page_strict(&reread).map_err(FetchError::Api)?;
+            let passed_boundary = collect_boundary_messages(
+                &reread,
+                boundary_seq,
+                &mut seen,
+                &mut boundary_msgs,
+                &mut recovered,
+            );
+            if passed_boundary || (reread.len() as i64) < used {
+                tracing::info!(
                 "[BatchMessageFetcher] issue #716：边界 msgSeq={boundary_seq} 补读完成，补入 {} 条",
                 recovered.len()
             );
-            return Ok(Some(SeqBoundaryBackfill {
-                boundary_seq,
-                messages: recovered,
-            }));
+                return Ok(Some(SeqBoundaryBackfill {
+                    boundary_seq,
+                    messages: recovered,
+                }));
+            }
         }
 
         // 第二步：边界 seq 本身超过一个窗口（重读页全是边界 seq 记录）。
@@ -1193,9 +1175,10 @@ impl BatchMessageFetcher {
             tracing::info!(
                 "[BatchMessageFetcher] issue #716：边界 msgSeq={boundary_seq} 占满整页，按 msgId={cursor_id} 向旧方向补读 (第 {requests}/{SEQ_BOUNDARY_BACKFILL_MAX_REQUESTS} 次)"
             );
-            let (history, _used) = self
+            let (history, used) = self
                 .seq_backfill_fetch(peer, SeqBackfillQuery::MsgId(cursor_id.as_str()))
                 .await?;
+            let history = extract_msg_page_strict(&history).map_err(FetchError::Api)?;
             let passed = collect_boundary_messages(
                 &history,
                 boundary_seq,
@@ -1204,7 +1187,7 @@ impl BatchMessageFetcher {
                 &mut recovered,
             );
             // 越过边界 seq 或到达空页（历史尾部）⇒ 边界已补齐。
-            if passed || history.is_empty() {
+            if passed || history.is_empty() || (crossed_start && (history.len() as i64) < used) {
                 break;
             }
             // 游标必须前进：最旧边界记录的 msgId 发生变化，否则会原地打转，
@@ -1279,6 +1262,10 @@ struct SeqBoundaryBackfill {
     boundary_seq: i64,
     /// 补入的消息（全部 msgSeq == boundary_seq 且 msgId 未见过）。
     messages: Vec<Value>,
+}
+
+fn seq_window_crosses_history_start(value: &Value) -> bool {
+    value.get("result").and_then(Value::as_i64) == Some(2_004_000)
 }
 
 /// 从序列分页响应中提取消息列表，并拒绝把原生错误 / 无效响应当成空页。
@@ -2162,6 +2149,7 @@ mod tests {
         /// 补读逻辑按集合语义处理（min / 去重 / 全量扫描），必须与返回顺序无关，
         /// 用该开关验证这一点。
         reverse_output: bool,
+        reject_short_seq_windows: bool,
     }
 
     impl SeqBoundaryMock {
@@ -2200,6 +2188,7 @@ mod tests {
                 scripted_seq: Mutex::new(VecDeque::new()),
                 stall_history: false,
                 reverse_output: false,
+                reject_short_seq_windows: false,
             }
         }
 
@@ -2300,6 +2289,9 @@ mod tests {
                 .take(count.max(0) as usize)
                 .cloned()
                 .collect();
+            if self.reject_short_seq_windows && (messages.len() as i64) < count {
+                return Ok(json!({"result": 2004000, "errMsg": "no any more msg!"}));
+            }
             if self.reverse_output {
                 messages.reverse();
             }
@@ -2340,6 +2332,29 @@ mod tests {
             previous = Some(batch);
         }
         ids
+    }
+
+    #[tokio::test]
+    async fn seq_history_start_recovers_partial_windows_and_shared_oldest_seq() {
+        // High sequence numbers also catch a cursor that walks empty history to zero.
+        let mut entries: Vec<_> = (100_001..=100_007)
+            .map(|seq| (seq.to_string(), seq, seq * 1_000))
+            .collect();
+        entries.push(("older-at-same-seq".into(), 100_001, 99_999_000));
+        let mut expected: Vec<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
+        let mut api = SeqBoundaryMock::new(entries);
+        api.reject_short_seq_windows = true;
+        let api = Arc::new(api);
+        let fetcher = BatchMessageFetcher::new(
+            Arc::clone(&api) as Arc<dyn MessageFetchApi>,
+            boundary_fetcher_config(),
+        );
+        let mut ids = collect_all_ids(&fetcher, &group_peer(), &MessageFilter::default()).await;
+        ids.sort();
+        expected.sort();
+        assert_eq!(ids, expected);
+        assert!(api.call_log().contains(&"seq:100002:2".to_string()));
+        assert_eq!(api.call_log().last().unwrap(), "seq:100000:1");
     }
 
     /// issue #716：页尾同一 msgSeq 被截断时，包含式补读必须找回 msgId=m99。
