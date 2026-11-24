@@ -2290,7 +2290,7 @@ mod tests {
                 .cloned()
                 .collect();
             if self.reject_short_seq_windows && (messages.len() as i64) < count {
-                return Ok(json!({"result": 2004000, "errMsg": "no any more msg!"}));
+                return Ok(json!({"result": 2_004_000, "errMsg": "no any more msg!"}));
             }
             if self.reverse_output {
                 messages.reverse();
